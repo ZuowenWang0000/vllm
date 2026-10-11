@@ -24,6 +24,7 @@ import torch
 from torch import nn
 from transformers import PreTrainedConfig
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -33,6 +34,7 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -46,6 +48,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.llama import LlamaMLP
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 
@@ -329,21 +332,24 @@ class LoopGateProjection(nn.Module):
             f"Expected {self.num_heads} heads, got {num_heads}"
         )
 
-        query_flat = query.reshape(-1, head_dim)
-
-        gate_logits_flat, _ = self.gate_proj(query_flat)
-
-        gate_logits = gate_logits_flat.reshape(
-            num_heads, num_tokens, self.num_heads
-        )  # [num_heads, num_tokens, num_heads]
-
-        # Extract diagonal: each head h's query should use output column h
-        # gate_logits[h, :, h] gives the output for head h at each token
-        gate_logits = torch.diagonal(
-            gate_logits, dim1=0, dim2=2
-        )  # [num_tokens, num_heads]
-        gate_logits = gate_logits.transpose(0, 1)  # [num_heads, num_tokens]
-        gate_logits = gate_logits.unsqueeze(-1)  # [num_heads, num_tokens, 1]
+        if (
+            type(self.gate_proj.quant_method) is UnquantizedLinearMethod
+            and not current_platform.is_cpu()
+            and not envs.VLLM_BATCH_INVARIANT
+        ):
+            # Only the matching head's dot product is used. Preserve linear
+            # dispatch for packed weights and batch-invariant execution.
+            gate_logits = torch.baddbmm(
+                self.gate_proj.bias.view(num_heads, 1, 1),
+                query,
+                self.gate_proj.weight.unsqueeze(-1),
+            )
+        else:
+            query_flat = query.reshape(-1, head_dim)
+            gate_logits_flat, _ = self.gate_proj(query_flat)
+            gate_logits = gate_logits_flat.reshape(num_heads, num_tokens, num_heads)
+            gate_logits = torch.diagonal(gate_logits, dim1=0, dim2=2)
+            gate_logits = gate_logits.transpose(0, 1).unsqueeze(-1)
 
         # Apply sigmoid
         gate = torch.sigmoid(gate_logits)  # [num_heads, num_tokens, 1]
